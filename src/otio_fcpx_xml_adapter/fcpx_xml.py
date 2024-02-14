@@ -2,12 +2,14 @@
 # Copyright Contributors to the OpenTimelineIO project
 
 """OpenTimelineIO Final Cut Pro X XML Adapter. """
+import math
 import os
 import subprocess
 from xml.etree import cElementTree
 from xml.dom import minidom
 from fractions import Fraction
 from datetime import date
+from typing import Optional
 from urllib.parse import unquote
 
 import opentimelineio as otio
@@ -16,14 +18,24 @@ META_NAMESPACE = "fcpx_xml"
 
 COMPOSABLE_ELEMENTS = ("video", "audio", "ref-clip", "asset-clip")
 
-FRAMERATE_FRAMEDURATION = {23.98: "1001/24000s",
-                           24: "25/600s",
-                           25: "1/25s",
-                           29.97: "1001/30000s",
-                           30: "100/3000s",
-                           50: "1/50s",
-                           59.94: "1001/60000s",
-                           60: "1/60s"}
+
+def rate_fraction_from_float(rate: float) -> Fraction:
+    """
+    Given a frame rate float, creates a frame rate fraction conforming to known
+    good rates where possible. This will do fuzzy matching of
+    23.98 to 24000/1001, for instance.
+    """
+    # Whole numbers are easy
+    if isinstance(rate, int) or rate.is_integer():
+        return Fraction(rate)
+
+    # See if there's an NTSC version of the rate that's reasonably close
+    ntsc_rate = Fraction(math.ceil(rate) * 1000, 1001)
+    # The tolerance of 0.004 comes from 24000/1001 - 23.98
+    if abs(rate - ntsc_rate) < 0.004:
+        return ntsc_rate
+
+    return Fraction(rate)
 
 
 def format_name(frame_rate, path):
@@ -76,7 +88,68 @@ def format_name(frame_rate, path):
     return f"FFVideoFormat{frame_size}p{frame_rate}"
 
 
-def to_rational_time(rational_number, fps):
+def rate_from_format(format_name: str) -> Optional[Fraction]:
+    """
+    returns the frame rate for the provided format name.
+
+    Args:
+        format_name: One of the FCP XML format names.
+
+    Returns: A rate fraction or None if the format name is not recognized or is
+    FFVideoFormatRateUndefined
+    """
+
+    if format_name == "FFVideoFormatRateUndefined":
+        return None
+    format_fps_string = format_name.split("_")[0].split("p")[-1].split("i")[-1]
+    is_interlaced = f"i{format_fps_string}" in format_name
+    denom_coeff = 2 if is_interlaced else 1
+    FORMAT_FPS_TO_FRAMERATE = {
+        "2398": Fraction(24000, 1001 * denom_coeff),
+        "24": Fraction(24, denom_coeff),
+        "25": Fraction(25, denom_coeff),
+        "2997": Fraction(30000, 1001 * denom_coeff),
+        "30": Fraction(30, denom_coeff),
+        "50": Fraction(50, denom_coeff),
+        "5994": Fraction(60000, 1001 * denom_coeff),
+        "60": Fraction(60, denom_coeff),
+    }
+    return FORMAT_FPS_TO_FRAMERATE.get(format_fps_string, None)
+
+
+def rate_from_format_element(media_format: cElementTree.Element) -> Optional[Fraction]:
+    """
+    returns the frame rate for the provided format element.
+
+    Args:
+        format_element: A format element from an FCP XML
+
+    Returns: A rate fraction or None if the format name is not recognized or is
+    FFVideoFormatRateUndefined
+    """
+    # Start by seeing if an explicit frame duration is provided
+    frame_duration = media_format.get("frameDuration")
+    if frame_duration is not None:
+        # We only handle frame durations in seconds
+        if not frame_duration.endswith("s"):
+            raise ValueError(
+                f"Unsupported frameDuration format: {frame_duration}"
+            )
+        duration_fraction_string = frame_duration.replace("s", "")
+        frame_duration = Fraction(duration_fraction_string)
+        return Fraction(frame_duration.denominator, frame_duration.numerator)
+
+    format_name = media_format.get("name")
+    if format_name is None:
+        format_id = media_format.get("id")
+        raise ValueError(
+            f"No format name or frameDuration found for {format_id}"
+        )
+
+    return rate_from_format(format_name)
+
+
+def to_rational_time(rational_number: str, fps: Optional[Fraction] = None):
     """
     This converts a rational number value to an otio RationalTime object
 
@@ -87,19 +160,23 @@ def to_rational_time(rational_number, fps):
     Returns:
         RationalTime: A RationalTime object
     """
+    if rational_number is None:
+        return otio.opentime.RationalTime(0, fps)
+    elif not rational_number.endswith("s"):
+        raise ValueError(
+            f"Unsupported rational number format: {rational_number}"
+        )
 
-    if rational_number == "0s" or rational_number is None:
-        frames = 0
-    else:
-        parts = rational_number.split("/")
-        if len(parts) > 1:
-            frames = int(
-                float(parts[0]) / float(parts[1].replace("s", "")) * float(fps)
-            )
-        else:
-            frames = int(float(parts[0].replace("s", "")) * float(fps))
+    number_fraction = Fraction(rational_number.replace("s", ""))
+    rational_time = otio.opentime.RationalTime(
+        number_fraction.numerator, rate=number_fraction.denominator
+    )
+    if fps is None:
+        return rational_time
 
-    return otio.opentime.RationalTime(frames, int(fps))
+    rescaled_time = rational_time.rescaled_to(float(fps))
+
+    return rescaled_time
 
 
 def from_rational_time(rational_time):
@@ -113,14 +190,12 @@ def from_rational_time(rational_time):
         str: A rational number as a string
     """
 
-    if int(rational_time.value) == 0:
+    if rational_time.value == 0:
         return "0s"
     result = Fraction(
         float(rational_time.value) / float(rational_time.rate)
     ).limit_denominator()
-    if str(result.denominator) == "1":
-        return f"{result.numerator}s"
-    return f"{result.numerator}/{result.denominator}s"
+    return f"{str(result)}s"
 
 
 class FcpxOtio:
@@ -340,28 +415,24 @@ class FcpxOtio:
         format_element = self.resource_element.find(
             f"./format[@id='{format_id}']"
         )
-        total, rate = format_element.get("frameDuration").split("/")
-        rate = rate.replace("s", "")
-        return int(float(rate) / float(total))
+        rate = rate_from_format_element(format_element)
+        return float(rate)
 
     def _element_for_item(self, item, lane, ref_only=False, compound=False):
-        element = None
         duration = self._calculate_rational_number(
             item.duration().value,
             item.duration().rate
         )
-        if item.schema_name() == "Clip":
+        if isinstance(item, otio.schema.Clip):
             asset_id = self._add_asset(item, compound_only=compound)
             element = self._element_for_clip(item, asset_id, duration, lane)
-
-        if item.schema_name() == "Gap":
+        elif isinstance(item, otio.schema.Gap):
             element = self._element_for_gap(item, duration)
-
-        if item.schema_name() == "Stack":
+        elif isinstance(item, otio.schema.Stack):
             element = self._element_for_stack(item, duration, ref_only)
-
-        if element is None:
+        else:
             return None
+
         if lane:
             element.set("lane", str(lane))
         for marker in item.markers:
@@ -672,11 +743,9 @@ class FcpxOtio:
     # --------------------
 
     @staticmethod
-    def _framerate_to_frame_duration(framerate):
-        frame_duration = FRAMERATE_FRAMEDURATION.get(int(framerate), "")
-        if not frame_duration:
-            frame_duration = FRAMERATE_FRAMEDURATION.get(float(framerate), "")
-        return frame_duration
+    def _framerate_to_frame_duration(framerate: float) -> str:
+        rate_fraction = rate_fraction_from_float(framerate)
+        return f"{rate_fraction.denominator}/{rate_fraction.numerator}s"
 
     @staticmethod
     def _target_url_from_clip(clip):
@@ -955,35 +1024,23 @@ class FcpxXml:
             lane = clip.get("lane", "0")
             spine = False
 
-        clip_offset_frames = self._number_of_frames(
-            clip.get("offset"),
-            clip_format_id
-        )
+        clip_offset = to_rational_time(clip.get("offset"))
 
         if spine:
-            parent_start_frames = 0
+            parent_start = otio.opentime.RationalTime()
         else:
-            parent_start_frames = self._number_of_frames(
-                parent.get("start", None),
-                parent_format_id
+            parent_start = to_rational_time(
+                parent.get("start", "0s")
             )
 
-        parent_offset_frames = self._number_of_frames(
-            parent.get("offset", None),
-            parent_format_id
-        )
+        parent_offset = to_rational_time(parent.get("offset", "0s"))
 
-        clip_offset_frames = (
-            (int(clip_offset_frames) - int(parent_start_frames)) +
-            int(parent_offset_frames)
-        )
+        clip_offset = clip_offset - parent_start + parent_offset
+        rate = self._format_frame_rate(clip_format_id)
+        if rate is not None:
+            clip_offset = clip_offset.rescaled_to(float(rate))
 
-        offset = otio.opentime.RationalTime(
-            clip_offset_frames,
-            self._format_frame_rate(clip_format_id)
-        )
-
-        return offset, lane
+        return clip_offset, lane
 
     def _format_id_for_clip(self, clip, default_format):
         if not clip.get("ref", None) or clip.tag == "gap":
@@ -992,9 +1049,12 @@ class FcpxXml:
         resource = self._asset_by_id(clip.get("ref"))
 
         if resource is None:
-            resource = self._compound_clip_by_id(
-                clip.get("ref")
-            ).find("sequence")
+            try:
+                resource = self._compound_clip_by_id(
+                    clip.get("ref")
+                ).find("sequence")
+            except AttributeError:
+                pass
 
         return resource.get("format", default_format)
 
@@ -1047,43 +1107,30 @@ class FcpxXml:
     # time helpers
     # --------------------
     def _format_frame_duration(self, format_id):
-        media_format = self._format_by_id(format_id)
-        total, rate = media_format.get("frameDuration").split("/")
-        rate = rate.replace("s", "")
-        return total, rate
+        frame_rate = self._format_frame_rate(format_id)
+        if frame_rate is None:
+            return None
+        return Fraction(frame_rate.denominator, frame_rate.numerator)
 
     def _format_frame_rate(self, format_id):
-        fd_total, fd_rate = self._format_frame_duration(format_id)
-        return int(float(fd_rate) / float(fd_total))
+        media_format = self._format_by_id(format_id)
+        return rate_from_format_element(media_format)
 
     def _number_of_frames(self, time_value, format_id):
-        if time_value == "0s" or time_value is None:
-            return 0
-        fd_total, fd_rate = self._format_frame_duration(format_id)
-        time_value = time_value.split("/")
+        frame_rate = self._format_frame_rate(format_id)
+        value_rational_time = to_rational_time(time_value, frame_rate)
 
-        if len(time_value) > 1:
-            time_value_a, time_value_b = time_value
-            return int(
-                (float(time_value_a) / float(time_value_b.replace("s", ""))) *
-                (float(fd_rate) / float(fd_total))
-            )
+        if frame_rate is None:
+            return value_rational_time.to_frames()
 
-        return int(
-            int(time_value[0].replace("s", "")) *
-            (float(fd_rate) / float(fd_total))
-        )
+        return value_rational_time.to_frames(rate=float(frame_rate))
 
     def _time_range(self, element, format_id):
+        frame_rate = self._format_frame_rate(format_id)
+
         return otio.opentime.TimeRange(
-            start_time=to_rational_time(
-                element.get("start", "0s"),
-                self._format_frame_rate(format_id)
-            ),
-            duration=to_rational_time(
-                element.get("duration"),
-                self._format_frame_rate(format_id)
-            )
+            start_time=to_rational_time(element.get("start", "0s"), frame_rate),
+            duration=to_rational_time(element.get("duration"), frame_rate)
         )
     # --------------------
     # search helpers
